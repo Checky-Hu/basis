@@ -2,9 +2,7 @@
 
 #include <pthread.h>
 #include <semaphore.h>
-#ifdef MESSAGE_QUEUE_DEBUG_ENABLE
 #include <stdio.h>
-#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -210,15 +208,7 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
   Message* message = NULL;
   // Timeout for getting next message.
   struct timespec timeout;
-  memset(&timeout, 0, sizeof(struct timespec));
-  while (true) {
-    // Wait for new incoming message.
-    if (0 == timeout.tv_sec) {
-      sem_wait(&(queue->queue_sem));
-    } else {
-      sem_timedwait(&(queue->queue_sem), &timeout);
-    }
-
+  do {
     bool blocked = true;
     MESSAGE_QUEUE_LOCK(queue);
     message = queue->header;
@@ -241,10 +231,17 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
     queue->blocked = blocked;
     MESSAGE_QUEUE_UNLOCK(queue);
 
-    if (!blocked) {
+    if (blocked) {
+      // Wait for new incoming message.
+      if (0 == timeout.tv_sec) {
+        sem_wait(&(queue->queue_sem));
+      } else {
+        sem_timedwait(&(queue->queue_sem), &timeout);
+      }
+    } else {
       break;
     }
-  }
+  } while (true);
   return message;
 }
 
