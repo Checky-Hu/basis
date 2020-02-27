@@ -4,9 +4,9 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#define TEST_DEBUG(...) printf(...)
+#define TEST_DEBUG(args...) printf(args)
 
-#define SITA_ASSERT(expression, words) \
+#define TEST_ASSERT(expression, words) \
   do {\
     if (!(expression)) {\
       TEST_DEBUG("%s: %s\n", __FUNCTION__, words);\

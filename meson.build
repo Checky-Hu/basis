@@ -46,4 +46,6 @@ libbasis_static = static_library(
   dependencies: deps,
 )
 
+subdir('test')
+
 
