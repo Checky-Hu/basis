@@ -1,7 +1,6 @@
 #include "sita_looper.h"
 
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +18,12 @@ typedef struct Message {
   // Magic number to check this message.
   unsigned int magic;
   MessageType type;
+  // Target execution time.
   struct timespec when;
+  // Task from user.
   SitaLooperTask task;
+  // Done flag only for sync message.
+  bool* done;
   struct Message* next;
 } Message;
 
@@ -44,10 +47,10 @@ typedef struct MessageQueue {
   MessageQueueState state;
   // Whether this queue is blocked.
   bool blocked;
-  // Semaphore used to block user thread.
-  sem_t user_sem;
-  // Semaphore used to block queue thread.
-  sem_t queue_sem;
+  // Thread condition used to block user thread.
+  pthread_cond_t user_cond;
+  // Thread condition used to block queue thread.
+  pthread_cond_t queue_cond;
   // Queue thread.
   pthread_t thread;
   // Mutex used to lock this queue.
@@ -162,8 +165,8 @@ SitaLooper SitaLooperInit(const char* name,
   queue->handle_task_func = handle_task_func;
   queue->state = Unstarted;
   queue->blocked = false;
-  sem_init(&(queue->user_sem), 0, 0);
-  sem_init(&(queue->queue_sem), 0, 0);
+  pthread_cond_init(&(queue->user_cond), NULL);
+  pthread_cond_init(&(queue->queue_cond), NULL);
   pthread_mutex_init(&(queue->mutex), NULL);
   queue->capacity = capacity;
   queue->index = 0;
@@ -193,8 +196,8 @@ bool SitaLooperDeinit(SitaLooper looper) {
 
   if (state == Stopped) {
     // Queue already stopped, so destroy it.
-    sem_destroy(&(queue->user_sem));
-    sem_destroy(&(queue->queue_sem));
+    pthread_cond_destroy(&(queue->user_cond));
+    pthread_cond_destroy(&(queue->queue_cond));
     pthread_mutex_destroy(&(queue->mutex));
     free(queue);
     return true;
@@ -210,8 +213,8 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
   // Timeout for getting next message.
   struct timespec timeout;
   do {
-    bool blocked = true;
     MESSAGE_QUEUE_LOCK(queue);
+    queue->blocked = true;
     message = queue->header;
     if (message) {
       struct timespec now;
@@ -219,27 +222,30 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
       if (CompareTimeSpec(&(message->when), &now)) {
         // Remove message from queue.
         queue->header = message->next;
-        blocked = false;
+        queue->blocked = false;
       } else {
         // Wait until new message coming or |when| of header message arriving.
         timeout.tv_sec = message->when.tv_sec;
         timeout.tv_nsec = message->when.tv_nsec;
       }
     } else {
-      // Queue is empty, dead wait.
+      // Queue is empty, deadly wait.
       timeout.tv_sec = 0;
     }
-    queue->blocked = blocked;
-    MESSAGE_QUEUE_UNLOCK(queue);
 
-    if (blocked) {
+    if (queue->blocked) {
       // Wait for new incoming message.
       if (0 == timeout.tv_sec) {
-        sem_wait(&(queue->queue_sem));
+        while (queue->blocked) {
+          pthread_cond_wait(&(queue->queue_cond), &(queue->mutex));
+        }
       } else {
-        sem_timedwait(&(queue->queue_sem), &timeout);
+        pthread_cond_timedwait(&(queue->queue_cond),
+            &(queue->mutex), &timeout);
       }
+      MESSAGE_QUEUE_UNLOCK(queue);
     } else {
+      MESSAGE_QUEUE_UNLOCK(queue);
       break;
     }
   } while (true);
@@ -251,10 +257,9 @@ static void* MessageQueueLoop(void* param) {
   MESSAGE_QUEUE_LOCK(queue);
   // Transform state from unstarted to started.
   queue->state = Started;
-  MESSAGE_QUEUE_UNLOCK(queue);
-
   // Notify user thread that start progress has done.
-  sem_post(&(queue->user_sem));
+  pthread_cond_signal(&(queue->user_cond));
+  MESSAGE_QUEUE_UNLOCK(queue);
 
   while (true) {
     Message* message = MessageQueueGetNextMessage(queue);
@@ -265,11 +270,12 @@ static void* MessageQueueLoop(void* param) {
       break;
     } else {
       queue->handle_task_func((SitaLooper)queue, &(message->task), queue->user_data);
+      MESSAGE_QUEUE_LOCK(queue);
       // Finish sync task, so notify user thread that the task has done.
       if (message->type == USER_SYNC) {
-        sem_post(&(queue->user_sem));
+        *(message->done) = true;
+        pthread_cond_signal(&(queue->user_cond));
       }
-      MESSAGE_QUEUE_LOCK(queue);
       message->magic = ~(queue->magic);
       MESSAGE_QUEUE_UNLOCK(queue);
     }
@@ -280,7 +286,8 @@ static void* MessageQueueLoop(void* param) {
 static bool MessageQueueSendMessage(MessageQueue* queue,
     MessageType type,
     long delay_ms,
-    const SitaLooperTask* task) {
+    const SitaLooperTask* task,
+    bool* done) {
   MESSAGE_QUEUE_LOCK(queue);
   // Check state first.
   if (queue->state != Started) {
@@ -302,44 +309,42 @@ static bool MessageQueueSendMessage(MessageQueue* queue,
   clock_gettime(CLOCK_MONOTONIC, &(message->when));
   switch (type) {
     case USER_ASYNC:
-    case USER_SYNC:
       message->when.tv_sec += delay_ms / 1000;
       message->when.tv_nsec += (delay_ms % 1000) * 1000000;
       // Init |data| field of message.
       memcpy(&(message->task), task, sizeof(SitaLooperTask));
       break;
+    case USER_SYNC:
+      // Init |data| field of message.
+      memcpy(&(message->task), task, sizeof(SitaLooperTask));
+      // Init |done| field of message.
+      message->done = done;
     default:
       break;
   }
 
   bool wakeup = false;
-  if (message->type == INTERNAL_EXIT) {
-    message->next = queue->header;
-    queue->header = message;
-    // Get new header, might need to wake up.
-    wakeup = queue->blocked;
-  } else {
-    Message* pre = NULL;
-    Message* cur = queue->header;
-    while (cur && CompareTimeSpec(&(cur->when), &(message->when))) {
-      pre = cur;
-      cur = cur->next;
-    }
-    message->next = cur;
-    if (pre) {
-      // Insert at middle.
-      pre->next = message;
-    } else {
-      // Insert at head.
-      queue->header = message;
-      wakeup = queue->blocked;
-    }
+  Message* pre = NULL;
+  Message* cur = queue->header;
+  while (cur && CompareTimeSpec(&(cur->when), &(message->when))) {
+    pre = cur;
+    cur = cur->next;
   }
-  MESSAGE_QUEUE_UNLOCK(queue);
+  message->next = cur;
+  if (pre) {
+    // Insert at middle.
+    pre->next = message;
+  } else {
+    // Insert at head.
+    queue->header = message;
+    wakeup = queue->blocked;
+  }
 
   if (wakeup) {
-    sem_post(&(queue->queue_sem));
+    queue->blocked = false;
+    pthread_cond_signal(&(queue->queue_cond));
   }
+  MESSAGE_QUEUE_UNLOCK(queue);
 
   return true;
 }
@@ -348,26 +353,25 @@ bool SitaLooperStart(SitaLooper looper) {
   MessageQueue* queue = (MessageQueue*)looper;
   MESSAGE_QUEUE_CHECK(queue);
 
-  MessageQueueState state = Unknown;
+  bool ret = false;
   MESSAGE_QUEUE_LOCK(queue);
-  state = queue->state;
-  MESSAGE_QUEUE_UNLOCK(queue);
-
-  if (state == Unstarted) {
+  if (queue->state == Unstarted) {
     // Queue is unstarted, so start it.
     if (pthread_create(&(queue->thread), NULL, MessageQueueLoop, queue)) {
       MESSAGE_QUEUE_DEBUG("can't create thread");
-      return false;
     } else {
       // Wait until the queue thread notify that start progress has done.
-      sem_wait(&(queue->user_sem));
-      return true;
+      while (queue->state != Started) {
+        pthread_cond_wait(&(queue->user_cond), &(queue->mutex));
+      }
+      ret = true;
     }
   } else {
     // Wrong state of queue.
-    MESSAGE_QUEUE_DEBUG("state = %d is invalid\n", state);
-    return false;
+    MESSAGE_QUEUE_DEBUG("queue->state = %d is invalid\n", queue->state);
   }
+  MESSAGE_QUEUE_UNLOCK(queue);
+  return ret;
 }
 
 bool SitaLooperStop(SitaLooper looper) {
@@ -381,7 +385,7 @@ bool SitaLooperStop(SitaLooper looper) {
 
   if (state == Started) {
     // Queue is started, so stop it.
-    MessageQueueSendMessage((MessageQueue*)looper, INTERNAL_EXIT, 0, NULL);
+    MessageQueueSendMessage(queue, INTERNAL_EXIT, 0, NULL, NULL);
     pthread_join(queue->thread, NULL);
     return true;
   } else {
@@ -394,9 +398,14 @@ bool SitaLooperStop(SitaLooper looper) {
 bool SitaLooperExecSyncTask(SitaLooper looper, const SitaLooperTask* task) {
   MessageQueue* queue = (MessageQueue*)looper;
   MESSAGE_QUEUE_CHECK(queue);
-  if (MessageQueueSendMessage(queue, USER_SYNC, 0, task)) {
+  bool done = false;
+  if (MessageQueueSendMessage(queue, USER_SYNC, 0, task, &done)) {
     // Wait until the queue thread notify that sync task has done.
-    sem_wait(&(queue->user_sem));
+    MESSAGE_QUEUE_LOCK(queue);
+    while (!done) {
+      pthread_cond_wait(&(queue->user_cond), &(queue->mutex));
+    }
+    MESSAGE_QUEUE_UNLOCK(queue);
     return true;
   } else {
     MESSAGE_QUEUE_DEBUG("internal error of looper");
@@ -408,6 +417,6 @@ bool SitaLooperPostAsyncTask(SitaLooper looper,
     const SitaLooperTask* task, long delay_ms) {
   MessageQueue* queue = (MessageQueue*)looper;
   MESSAGE_QUEUE_CHECK(queue);
-  return MessageQueueSendMessage(queue, USER_ASYNC, delay_ms, task);
+  return MessageQueueSendMessage(queue, USER_ASYNC, delay_ms, task, NULL);
 }
 
