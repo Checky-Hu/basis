@@ -62,8 +62,9 @@ typedef struct MessageQueue {
   Message** messages;
 } MessageQueue;
 
+#define MESSAGE_QUEUE_DEBUG_ENABLE
 #ifdef MESSAGE_QUEUE_DEBUG_ENABLE
-#define MESSAGE_QUEUE_DEBUG(...) printf(__VA_ARGS__)
+#define MESSAGE_QUEUE_DEBUG(format, ...) printf("%s:"format"\n", __func__, ##__VA_ARGS__)
 #else
 #define MESSAGE_QUEUE_DEBUG(...)
 #endif
@@ -72,7 +73,7 @@ typedef struct MessageQueue {
 #define MESSAGE_QUEUE_CHECK(queue) \
   do {\
     if (!queue || queue->magic != MESSAGE_QUEUE_MAGIC_NUM) {\
-      MESSAGE_QUEUE_DEBUG("invalid queue = 0x%p\n", queue);\
+      MESSAGE_QUEUE_DEBUG("invalid queue = 0x%p", (void*)queue);\
       return false;\
     }\
   } while (0)
@@ -80,14 +81,14 @@ typedef struct MessageQueue {
 #define MESSAGE_QUEUE_LOCK(queue) \
   do {\
     if (pthread_mutex_lock(&(queue->mutex))) {\
-      MESSAGE_QUEUE_DEBUG("mutex lock failed\n");\
+      MESSAGE_QUEUE_DEBUG("mutex lock failed");\
     }\
   } while (0)
 
 #define MESSAGE_QUEUE_UNLOCK(queue) \
   do {\
     if (pthread_mutex_unlock(&(queue->mutex))) {\
-      MESSAGE_QUEUE_DEBUG("mutex unlock failed\n");\
+      MESSAGE_QUEUE_DEBUG("mutex unlock failed");\
     }\
   } while (0)
 
@@ -134,7 +135,7 @@ SitaLooper SitaLooperInit(const char* name,
     SitaLooperHandleTaskFunc handle_task_func,
     void* user_data) {
   if (!name || !capacity || !handle_task_func) {
-    MESSAGE_QUEUE_DEBUG("%s: parameter error\n", __FUNCTION__);
+    MESSAGE_QUEUE_DEBUG("parameter error");
     return NULL;
   }
 
@@ -144,14 +145,14 @@ SitaLooper SitaLooperInit(const char* name,
   // |+ Array of |Message|
   size_t offset = sizeof(MessageQueue);
   if (offset & 3) {
-    MESSAGE_QUEUE_DEBUG("%s: %u is not 4 bytes aligned\n", __FUNCTION__, offset);
+    MESSAGE_QUEUE_DEBUG("%lu is not 4 bytes aligned", offset);
     return NULL;
   }
   size_t message_size = (sizeof(Message) + 3) & ~3;
   size_t total_size = offset + (sizeof(Message*) + message_size) * capacity;
   MessageQueue* queue = (MessageQueue*)malloc(total_size);
   if (!queue) {
-    MESSAGE_QUEUE_DEBUG("%s: malloc queue failed\n", __FUNCTION__);
+    MESSAGE_QUEUE_DEBUG("malloc queue failed");
     return NULL;
   }
 
@@ -199,7 +200,7 @@ bool SitaLooperDeinit(SitaLooper looper) {
     return true;
   } else {
     // Wrong state of Queue.
-    MESSAGE_QUEUE_DEBUG("%s: state = %d is invalid\n", __FUNCTION__, state);
+    MESSAGE_QUEUE_DEBUG("state = %d is invalid", state);
     return false;
   }
 }
@@ -283,14 +284,14 @@ static bool MessageQueueSendMessage(MessageQueue* queue,
   MESSAGE_QUEUE_LOCK(queue);
   // Check state first.
   if (queue->state != Started) {
-    MESSAGE_QUEUE_DEBUG("%s: state = %d is invalid\n", __FUNCTION__, queue->state);
+    MESSAGE_QUEUE_DEBUG("state = %d is invalid", queue->state);
     MESSAGE_QUEUE_UNLOCK(queue);
     return false;
   }
 
   Message* message = MessageQueueAllocMessage(queue);
   if (!message) {
-    MESSAGE_QUEUE_DEBUG("%s: alloc message failed\n", __FUNCTION__);
+    MESSAGE_QUEUE_DEBUG("alloc message failed");
     MESSAGE_QUEUE_UNLOCK(queue);
     return false;
   }
@@ -355,7 +356,7 @@ bool SitaLooperStart(SitaLooper looper) {
   if (state == Unstarted) {
     // Queue is unstarted, so start it.
     if (pthread_create(&(queue->thread), NULL, MessageQueueLoop, queue)) {
-      MESSAGE_QUEUE_DEBUG("%s: can't create thread\n", __FUNCTION__);
+      MESSAGE_QUEUE_DEBUG("can't create thread");
       return false;
     } else {
       // Wait until the queue thread notify that start progress has done.
@@ -364,7 +365,7 @@ bool SitaLooperStart(SitaLooper looper) {
     }
   } else {
     // Wrong state of queue.
-    MESSAGE_QUEUE_DEBUG("%s: state = %d is invalid\n", __FUNCTION__, state);
+    MESSAGE_QUEUE_DEBUG("state = %d is invalid\n", state);
     return false;
   }
 }
@@ -385,7 +386,7 @@ bool SitaLooperStop(SitaLooper looper) {
     return true;
   } else {
     // Wrong state of queue.
-    MESSAGE_QUEUE_DEBUG("%s: state = %d is invalid\n", __FUNCTION__, state);
+    MESSAGE_QUEUE_DEBUG("state = %d is invalid", state);
     return false;
   }
 }
@@ -398,7 +399,7 @@ bool SitaLooperExecSyncTask(SitaLooper looper, const SitaLooperTask* task) {
     sem_wait(&(queue->user_sem));
     return true;
   } else {
-    MESSAGE_QUEUE_DEBUG("%s: internal error of looper\n", __FUNCTION__);
+    MESSAGE_QUEUE_DEBUG("internal error of looper");
     return false;
   }
 }
