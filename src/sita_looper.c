@@ -45,8 +45,6 @@ typedef struct MessageQueue {
   SitaLooperHandleTaskFunc handle_task_func;
   // Current state of this queue.
   MessageQueueState state;
-  // Whether this queue is blocked.
-  bool blocked;
   // Thread condition used to block user thread.
   pthread_cond_t user_cond;
   // Thread condition used to block queue thread.
@@ -164,7 +162,6 @@ SitaLooper SitaLooperInit(const char* name,
   queue->user_data = user_data;
   queue->handle_task_func = handle_task_func;
   queue->state = Unstarted;
-  queue->blocked = false;
   pthread_cond_init(&(queue->user_cond), NULL);
   pthread_cond_init(&(queue->queue_cond), NULL);
   pthread_mutex_init(&(queue->mutex), NULL);
@@ -214,7 +211,7 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
   struct timespec timeout;
   do {
     MESSAGE_QUEUE_LOCK(queue);
-    queue->blocked = true;
+    bool blocked = true;
     message = queue->header;
     if (message) {
       struct timespec now;
@@ -222,7 +219,7 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
       if (CompareTimeSpec(&(message->when), &now)) {
         // Remove message from queue.
         queue->header = message->next;
-        queue->blocked = false;
+        blocked = false;
       } else {
         // Wait until new message coming or |when| of header message arriving.
         timeout.tv_sec = message->when.tv_sec;
@@ -233,10 +230,10 @@ static Message* MessageQueueGetNextMessage(MessageQueue* queue) {
       timeout.tv_sec = 0;
     }
 
-    if (queue->blocked) {
+    if (blocked) {
       // Wait for new incoming message.
       if (0 == timeout.tv_sec) {
-        while (queue->blocked) {
+        while (!(queue->header)) {
           pthread_cond_wait(&(queue->queue_cond), &(queue->mutex));
         }
       } else {
@@ -323,7 +320,6 @@ static bool MessageQueueSendMessage(MessageQueue* queue,
       break;
   }
 
-  bool wakeup = false;
   Message* pre = NULL;
   Message* cur = queue->header;
   while (cur && CompareTimeSpec(&(cur->when), &(message->when))) {
@@ -337,11 +333,6 @@ static bool MessageQueueSendMessage(MessageQueue* queue,
   } else {
     // Insert at head.
     queue->header = message;
-    wakeup = queue->blocked;
-  }
-
-  if (wakeup) {
-    queue->blocked = false;
     pthread_cond_signal(&(queue->queue_cond));
   }
   MESSAGE_QUEUE_UNLOCK(queue);
