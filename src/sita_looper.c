@@ -126,9 +126,9 @@ static Message* MessageQueueAllocMessage(MessageQueue* queue) {
 
 static bool CompareTimeSpec(struct timespec* a,
     struct timespec* b) {
-  long a_in_ns = a->tv_sec * 1000000000 + a->tv_nsec;
-  long b_in_ns = b->tv_sec * 1000000000 + b->tv_nsec;
-  return a_in_ns <= b_in_ns;
+  long a_in_ms = a->tv_sec * 1000 + a->tv_nsec / 1000000;
+  long b_in_ms = b->tv_sec * 1000 + b->tv_nsec / 1000000;
+  return a_in_ms <= b_in_ms;
 }
 
 SitaLooper SitaLooperInit(const char* name,
